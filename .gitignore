@@ -1,0 +1,7 @@
+# Python bytecode (e.g. from local syntax checks)
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+*.swp
