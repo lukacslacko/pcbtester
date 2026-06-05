@@ -276,8 +276,8 @@ Board: 2x RS flip-flop
 ```
 
 - **OLED display**: shows the live verdict at a glance — no laptop needed. It
-  **rotates through pages every ~1.5 s**: first a summary, then one detail page for
-  *each* failing gate, then back to the summary.
+  **rotates through pages**: a summary (~3.5 s), then one detail page for *each*
+  failing unit (~8 s each, since they carry more to read), then back to the summary.
 
   ```
   PAGE 1 — summary        PAGE 1 — summary        PAGE 2 — detail (per fault)
@@ -321,8 +321,9 @@ Board: 2x RS flip-flop
 - The **serial console** prints the full per-gate / per-flip-flop log each run; the
   OLED detail pages mirror it for the failing units without needing a laptop.
 
-> Tune the rotation speed with `PAGE_MS` near the top of `main.py` (milliseconds
-> per page; default 1500).
+> Tune the rotation speed near the top of `main.py`: `PAGE_MS` is the dwell for
+> summary/overview pages (default 3500 ms) and `DETAIL_MS` is the longer dwell for
+> failure-detail pages, which carry more to read (default 8000 ms).
 
 ---
 

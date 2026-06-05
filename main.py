@@ -65,7 +65,8 @@ led = Pin("LED", Pin.OUT)
 
 # ====== OLED status display (SSD1306, 128x64, I2C1 on GP26/GP27) ======
 OLED_W, OLED_H = 128, 64
-PAGE_MS = 1500           # ms each OLED page is shown before rotating
+PAGE_MS = 3500           # ms a summary/overview page is shown before rotating
+DETAIL_MS = 8000         # ms a failure-detail page is shown (more to read)
 oled = None
 try:
     from ssd1306 import SSD1306_I2C
@@ -85,11 +86,6 @@ def render_lines(lines, invert=0):
         oled.text(ln, 0, y)
         y += 9
     oled.show()
-
-
-def show_page(page):
-    lines, inv = page
-    render_lines(lines, inv)
 
 
 # ====== board 1: 3x open-collector NAND ======
@@ -132,13 +128,13 @@ def nand_pages(results, all_ok):
         summary.append("%s %s" % (name, "PASS" if ok else "FAIL"))
     summary.append("")
     summary.append("ALL GATES PASS" if all_ok else "** FAULT **")
-    pages = [(summary, 0 if all_ok else 1)]
+    pages = [(summary, 0 if all_ok else 1, PAGE_MS)]
     for name, ok, rows in results:
         if not ok:
             lines = ["%s FAIL" % name, "ab exp got"]
             for a, b, exp, got, p in rows:
                 lines.append("%d%d  %d   %d  %s" % (a, b, exp, got, "ok" if p else "BAD"))
-            pages.append((lines, 0))
+            pages.append((lines, 0, DETAIL_MS))
     return pages
 
 
@@ -212,7 +208,7 @@ def rs_pages(results, all_ok):
         summary.append("%s %s" % (name, "PASS" if ok else "FAIL"))
     summary.append("")
     summary.append("ALL FF PASS" if all_ok else "** FAULT **")
-    pages = [(summary, 0 if all_ok else 1)]
+    pages = [(summary, 0 if all_ok else 1, PAGE_MS)]
     for name, ok, fobs in results:
         if not ok:
             cyc, (r1, s1), (r2, s2) = fobs
@@ -222,7 +218,7 @@ def rs_pages(results, all_ok):
                      "SET   exp R1 S0",
                      " got R%d S%d %s" % (r2, s2, "ok" if (r2 == 1 and s2 == 0) else "BAD"),
                      "(cycle %d)" % cyc]
-            pages.append((lines, 0))
+            pages.append((lines, 0, DETAIL_MS))
     return pages
 
 
@@ -277,9 +273,9 @@ def main():
     render_lines(["PCB TESTER", "", "auto-detecting", "board ..."])
     while True:
         pages, all_ok = run_once()
-        for page in pages:
-            show_page(page)
-            dwell(PAGE_MS, all_ok)
+        for lines, inv, ms in pages:
+            render_lines(lines, inv)
+            dwell(ms, all_ok)
 
 
 if __name__ == "__main__":
