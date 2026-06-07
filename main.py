@@ -25,11 +25,15 @@
 # if a flip-flop works it's RS. Else fall back to XNOR (shown regardless). Set
 # BOARD below to force one type and skip detection.
 #
+# Optional NAND transistor-orientation check (ORIENT_CHECK, needs an ADC wire +
+# load resistor) measures a gate's output voltage under load to flag reversed
+# (collector/emitter-swapped) transistors, which still pass the truth table.
+#
 # Output: SBC-OLED01 (SSD1306) with page rotation, onboard LED, USB serial.
 # Needs ssd1306.py on the Pico too (optional; falls back to serial + LED).
 # ---------------------------------------------------------------------------
 
-from machine import Pin, I2C
+from machine import Pin, I2C, ADC
 import time
 
 # ====== board selection ======
@@ -128,11 +132,15 @@ def nand_test():
     return results
 
 
-def nand_pages(results, all_ok):
+def nand_pages(results, all_ok, vol_info=None):
     summary = ["3x NAND TESTER"]
     for name, ok, _ in results:
         summary.append("%s %s" % (name, "PASS" if ok else "FAIL"))
-    summary.append("")
+    if vol_info:                                 # show V_OL right on the summary
+        gname, vol, _fwd = vol_info
+        summary.append("%s VOL=%.2fV" % (gname.split()[0], vol))
+    else:
+        summary.append("")
     summary.append("ALL GATES PASS" if all_ok else "** FAULT **")
     pages = [(summary, 0 if all_ok else 1, PAGE_MS)]
     for name, ok, rows in results:
@@ -152,6 +160,69 @@ def print_nand(results, all_ok):
             print("     a=%d b=%d exp=%d got=%d %s"
                   % (a, b, exp, got, "ok" if p else "<- MISMATCH"))
     print("  RESULT:", "ALL GATES PASS" if all_ok else "FAULT DETECTED")
+
+
+# ====== optional: NAND transistor-orientation check (V_OL under load) ======
+# A correctly-built open-collector NAND sinks current through a high-beta FORWARD
+# transistor, so its output stays near 0 V even under load. If the two stacked
+# transistors are wired collector<->emitter swapped, they still pass the truth
+# table (saturation conducts both ways) but sink WEAKLY (low reverse beta), so
+# the output sags high under load. We expose that by loading one gate's output
+# and reading its low-level voltage (V_OL) on the ADC.
+#
+# Extra hardware (see README "Transistor-orientation check"), then set
+# ORIENT_CHECK = True (and remove the wires + set it back to False afterwards,
+# since the ADC jumper / load resistor get in the way of the RS-flip-flop board):
+#   - jumper the chosen gate's OUTPUT to GP28  (ADC2, physical pin 34)
+#   - ~1 kOhm resistor from that OUTPUT to GP22 (physical pin 29); GP22 is the
+#     switchable load driver, so the normal NAND test is left untouched.
+ORIENT_CHECK = False        # True only when the ADC wire + load resistor are fitted
+ORIENT_GATE = 0              # 0=G1 (out GP2), 1=G2 (out GP5), 2=G3 (out GP8)
+ORIENT_ADC_GP = 28          # GP28 = ADC2; jumper the gate output here
+ORIENT_LOAD_GP = 22         # GP22 -> ~1k -> gate output (load, on only during test)
+ORIENT_THRESH_V = 1.2       # V_OL above this = weak sink = likely reversed
+ADC_VREF = 3.3              # measured refs: forward ~0.20 V, reversed ~2.35 V
+
+
+# GP22 (load) and GP28 (ADC) live outside the DUT range GP0..GP9, so they get
+# their own objects (created lazily on first use) rather than going through
+# PINS[]/drive()/release().
+_orient_load = None
+_orient_adc = None
+
+
+def orient_test():
+    global _orient_load, _orient_adc
+    if _orient_load is None:
+        _orient_load = Pin(ORIENT_LOAD_GP, Pin.IN)   # start Hi-Z (load off)
+        _orient_adc = ADC(Pin(ORIENT_ADC_GP))
+    name, a_gp, b_gp, y_gp = NAND_GATES[ORIENT_GATE]
+    drive(NAND_GND, 0)                       # power the gate as usual (GND low)
+    for gp in NAND_DRIVE:
+        drive(gp, 0)
+    release(y_gp)                            # output sensed by the ADC, not pulled here
+    drive(a_gp, 1)                           # A=B=high -> a good gate pulls output LOW
+    drive(b_gp, 1)
+    _orient_load.init(Pin.OUT)               # apply the ~1k load toward 3.3 V
+    _orient_load.value(1)
+    time.sleep_ms(3)
+    acc = 0
+    for _ in range(16):
+        acc += _orient_adc.read_u16()
+        time.sleep_us(200)
+    vol = (acc / 16) / 65535 * ADC_VREF
+    _orient_load.init(Pin.IN)                # remove the load (Hi-Z) when done
+    return name, vol, (vol < ORIENT_THRESH_V)
+
+
+def orient_page(name, vol, forward):
+    return ([
+        "ORIENT %s" % name,
+        "V_OL=%.2f V" % vol,
+        "under ~1k load",
+        "",
+        "-> FORWARD ok" if forward else "-> REVERSED?",
+    ], 0 if forward else 1, DETAIL_MS)
 
 
 # ====== board 2: 2x RS flip-flop ======
@@ -308,8 +379,12 @@ def print_xnor(results, all_ok):
 
 
 # ====== orchestration ======
-def run_once():
-    print("\n=== PCB tester ===")
+RECHECK_TICKS = 6        # while a page shows, re-test every RECHECK_TICKS*100 ms
+
+
+def run_once(verbose=True):
+    if verbose:
+        print("\n=== PCB tester ===")
     if BOARD == "nand":
         kind, results = "nand", nand_test()
     elif BOARD == "rs":
@@ -322,46 +397,84 @@ def run_once():
         if any(ok for _, ok, _ in nres):
             kind, results = "nand", nres
         else:
-            print("No NAND gate behaved correctly -> trying RS flip-flop")
+            if verbose:
+                print("No NAND gate behaved correctly -> trying RS flip-flop")
             rres = rs_test()
             if any(ok for _, ok, _ in rres):
                 kind, results = "rs", rres
             else:
-                print("No RS flip-flop worked either -> testing as XNOR")
+                if verbose:
+                    print("No RS flip-flop worked either -> testing as XNOR")
                 kind, results = "xnor", xnor_test()
 
     all_ok = all(ok for _, ok, _ in results)
+    overall_ok = all_ok
+    orient_fwd = None                             # part of the change signature
+
     if kind == "nand":
-        print_nand(results, all_ok)
-        pages = nand_pages(results, all_ok)
+        vol_info = None
+        if ORIENT_CHECK:                          # measure V_OL of the wired gate
+            try:
+                oname, vol, fwd = orient_test()
+                vol_info = (oname, vol, fwd)
+                orient_fwd = fwd
+                if verbose:
+                    print("  ORIENT %s: V_OL = %.3f V under ~1k load -> %s"
+                          % (oname, vol, "forward (ok)" if fwd else "REVERSED?"))
+                overall_ok = overall_ok and fwd   # blink the LED if it looks reversed
+            except Exception as exc:              # never let the check freeze the rig
+                if verbose:
+                    print("  ORIENT check skipped (%s)" % exc)
+        if verbose:
+            print_nand(results, all_ok)
+        pages = nand_pages(results, all_ok, vol_info)
+        if vol_info:
+            pages.append(orient_page(*vol_info))  # plus the verdict page
     elif kind == "rs":
-        print_rs(results, all_ok)
+        if verbose:
+            print_rs(results, all_ok)
         pages = rs_pages(results, all_ok)
     else:
-        print_xnor(results, all_ok)
+        if verbose:
+            print_xnor(results, all_ok)
         pages = xnor_pages(results, all_ok)
-    return pages, all_ok
+
+    # stable identity of the result: board kind, pass/fail per unit, and the
+    # forward/reversed verdict (so swapping a good <-> reversed NAND counts as a
+    # change even though both pass). Excludes the noisy raw V_OL on purpose.
+    sig = (kind, tuple((name, ok) for name, ok, _ in results), orient_fwd)
+    return pages, overall_ok, sig
 
 
-def dwell(ms, all_ok):
-    """Wait `ms` while keeping the LED alive (steady=pass, blink=fail)."""
-    waited = 0
-    while waited < ms:
-        if all_ok:
-            led.on()
-        else:
-            led.toggle()
-        time.sleep_ms(100)
-        waited += 100
+def show_cycle(pages, all_ok, sig):
+    """Show each page for its dwell; meanwhile re-test periodically. Return True
+    as soon as the result changes (caller restarts the cycle), else False."""
+    for lines, inv, ms in pages:
+        render_lines(lines, inv)
+        waited = 0
+        ticks = 0
+        while waited < ms:
+            if all_ok:
+                led.on()
+            else:
+                led.toggle()                      # fast blink on any fault
+            time.sleep_ms(100)
+            waited += 100
+            ticks += 1
+            if ticks >= RECHECK_TICKS:
+                ticks = 0
+                if run_once(verbose=False)[2] != sig:
+                    return True                   # board / result changed
+    return False
 
 
 def main():
     render_lines(["PCB TESTER", "", "auto-detecting", "board ..."])
+    pages, all_ok, sig = run_once()
     while True:
-        pages, all_ok = run_once()
-        for lines, inv, ms in pages:
-            render_lines(lines, inv)
-            dwell(ms, all_ok)
+        if show_cycle(pages, all_ok, sig):
+            print("** change detected -> restarting display **")
+        pages, all_ok, sig = run_once()           # fresh result; restart from page 1
 
 
 if __name__ == "__main__":

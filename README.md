@@ -100,10 +100,13 @@ and also covers an open-collector one.
 - 14× male–male jumper wires (10 for the DUT + 4 for the OLED)
 - USB cable (micro-USB / USB-C to match your Pico) for power + serial
 - Any of the DUT boards (3× NAND, 2× RS flip-flop, 2× XNOR)
+- *(optional, for the §11 NAND orientation check)* 1× ~1 kΩ resistor + 2 jumpers
 
-No extra resistors are needed: the NAND/XNOR outputs use the Pico's internal
-pull-ups and the RS nodes use the board's own pull-ups. (Skip the series resistors
-the NAND-only build mentioned — see §5; they would stop the RS latches flipping.)
+No extra resistors are needed for normal testing: the NAND/XNOR outputs use the
+Pico's internal pull-ups and the RS nodes use the board's own pull-ups. (Skip the
+series resistors the NAND-only build mentioned — see §5; they would stop the RS
+latches flipping.) The one optional resistor above is only for the orientation
+check in §11.
 
 You do **not** need an external power supply; the Pico is powered over USB, the
 OLED (~15 mA) and both DUTs run off the Pico's 3V3 rail / GPIOs, well within
@@ -274,8 +277,16 @@ The tester runs in **MicroPython**.
 
 ## 7. Run and read the result
 
-- With `main.py` on the Pico, it runs automatically at power-up, **auto-detects
-  the board, and re-tests every couple of seconds** (so you can hot-swap boards).
+- With `main.py` on the Pico, it runs automatically at power-up and **auto-detects
+  the board**.
+- **Live board-change detection:** while a page is on screen it keeps re-testing in
+  the background (~every 600 ms, `RECHECK_TICKS` × 100 ms). The moment the result
+  changes — a different board type, a unit flipping pass↔fail, or a good↔reversed
+  NAND swap (the forward/reversed verdict is part of the signature) — it abandons
+  the current page and **restarts the display from page 1** with the new result.
+  So you can hot-swap boards and the screen follows immediately rather than waiting
+  out the current page. (The raw V_OL is deliberately *excluded* from the
+  change-signature so ADC noise doesn't trigger constant restarts.)
 - Detection, in order: run the NAND test — if **any gate** behaves like a NAND
   it's NAND. Else run the RS test — if **any latch** works it's RS. Else fall back
   to **XNOR**, which is tested and reported regardless of the result.
@@ -478,7 +489,119 @@ This rig is a general pattern. To add a third board:
 
 ---
 
-## 11. License
+## 11. Optional: NAND transistor-orientation check (ADC)
+
+A 2-transistor open-collector NAND gate (`OUT —[T_top]— MID —[T_bot]— GND`, an
+input on each base) computes the **same truth table whether or not the
+collector/emitter of each transistor are swapped** — a saturated BJT conducts both
+ways, so a "reversed" build still passes §9's logic test. The difference is purely
+analog: a correct (forward) build sinks current with high gain and holds its
+output near 0 V *under load*; a reversed build sinks weakly (low reverse β) and its
+output **sags high under load**. This optional check measures that directly:
+drive a gate to its low state, load it, and read the low-level voltage **V_OL** on
+the ADC.
+
+### Hardware to add (one resistor + one jumper)
+
+The ADC lives on the Pico's right edge. Pick a gate to instrument — by default
+**G1**, whose output is DUT pin 3 → **GP2** (physical pin 4) on the left edge — and
+add:
+
+| Add | From | To | Why |
+|-----|------|----|-----|
+| **jumper** | gate output (G1 = GP2 / phys 4) | **GP28** (ADC2, phys 34) | sense V_OL with the ADC |
+| **~1 kΩ resistor** | gate output (same node) | **GP22** (phys 29) | switchable load (~3 mA at 3.3 V) |
+
+```
+   left edge                         right edge of Pico
+   ┌─────────────┐                   ┌───────────────────┐
+   │ ...         │              GP22 │ 29  ◄──[ 1k ]──┐   │
+   │ 3 ~(A&B) ●──┼── GP2 (phys 4)    │ 30  RUN        │   │
+   │ ...      │  │      │            │ ...            │   │
+   └──────────┼──┘      │            │ 34  GP28 ◄─────┤   │  ADC sense
+              │         └────────────┼────────────────┘   │
+              └── G1 output node ─────┘ (one breadboard row carries GP2,
+                                          the 1k to GP22, and the wire to GP28)
+   ```
+
+All three — GP2 (its normal pin), the 1 kΩ to GP22, and the jumper to GP28 — land
+on the **same breadboard row** as the gate's output. GP22 is driven (not the 3V3
+rail) so the load is applied **only during this check**; your normal NAND test
+stays unaffected.
+
+### Enable it
+
+In `main.py`, set `ORIENT_CHECK = True` (top of the orientation block). Options
+there:
+
+- `ORIENT_GATE` — `0`/`1`/`2` for G1/G2/G3 (their outputs are GP2/GP5/GP8). To
+  check a different gate, move the two wires to that gate's output row and set this.
+- `ORIENT_THRESH_V` — verdict threshold (default `1.2` V, calibrated below).
+- `ORIENT_ADC_GP` / `ORIENT_LOAD_GP` — the ADC and load pins if you wire elsewhere.
+
+> **This is a bench check, not a permanent fixture.** The ADC jumper and load
+> resistor sit on GP2, which is the RS board's pin 3, and they interfere with that
+> board — so when you're done measuring, **remove both wires and set
+> `ORIENT_CHECK = False`** before going back to normal multi-board testing. (With
+> `ORIENT_CHECK = False` the code never touches GP22/GP28, so it's safe to leave it
+> off even if you forget to pull the wires — but pull them for RS testing.)
+
+### Reading it
+
+The measured V_OL shows up in three places: a serial line (to 1 mV), an extra
+verdict page, **and right on the NAND summary page** (so you can read it off a
+passing board without a laptop):
+
+```
+  ORIENT G1: V_OL = 0.200 V under ~1k load -> forward (ok)     # serial, correct build
+  ORIENT G1: V_OL = 2.350 V under ~1k load -> REVERSED?        # serial, weak sink
+```
+
+```
+3x NAND TESTER          ORIENT G1
+G1 ~(A&B) PASS          V_OL=2.35 V
+G2 ~(C&D) PASS          under ~1k load
+G3 ~(E&F) PASS          -> REVERSED?
+G1 VOL=2.35V            (verdict page; inverts,
+ALL GATES PASS           LED blinks if reversed)
+```
+
+The summary's `G1 VOL=…` line appears whenever `ORIENT_CHECK = True`, pass or fail,
+so comparing a good board against a suspect one is just a matter of reading that
+number off each. To measure a different gate, move the two wires to its output row
+and set `ORIENT_GATE` (the label follows, e.g. `G2 VOL=…`).
+
+A low V_OL (well under the threshold) means the gate sinks the load easily —
+forward transistors. A high V_OL means it can't hold its output down under load —
+the signature of reversed (or otherwise weak/low-β) transistors. If the verdict is
+`REVERSED?`, the page inverts and the onboard LED blinks even though the truth
+table passed.
+
+### Calibrating
+
+The exact numbers depend on your transistors' reverse β and your base-resistor
+value, so treat the threshold as tunable. On this build a forward gate measured
+**~0.20 V** and a reversed one **~2.35 V** under a 1 kΩ load, so the default
+`ORIENT_THRESH_V = 1.2` sits comfortably between them:
+
+- **Best:** measure a gate you *trust* is forward and one you suspect; put the
+  threshold between them (that's where 1.2 V came from).
+- A **forward** gate should read a few tenths of a volt or less. A **reversed**
+  gate typically reads ≳ 1 V at ~3 mA load.
+- If *both* read low, the load is too gentle to starve the reversed gate — drop
+  the resistor (e.g. 1 kΩ → 470 Ω) to push more current. If a known-forward gate
+  reads high, raise the resistor. The discriminating window is roughly
+  `β_reverse·I_base < I_load < β_forward·I_base`.
+- Don't exceed ~10 mA of load (keep the resistor ≥ 330 Ω) so the Pico pin and the
+  gate stay comfortable, and never let the sensed node exceed 3.3 V (it won't here).
+
+> This measures the gate's real **drive strength**, which is exactly what reversed
+> transistors degrade — so even if you'd rather call the cause "low β" than
+> "reversed," a high V_OL tells you the gate is weak and out of spec.
+
+---
+
+## 12. License
 
 This project is released under the [MIT License](LICENSE).
 
