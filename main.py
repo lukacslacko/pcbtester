@@ -21,9 +21,13 @@
 #       VCC=GP5 high, GND=GP4 low. Drive each gate's two inputs, read the
 #       output (= 1 iff the inputs are equal).
 #
-# Auto-detection: run the NAND test; if a gate works it's NAND. Else the RS test;
-# if a flip-flop works it's RS. Else fall back to XNOR (shown regardless). Set
-# BOARD below to force one type and skip detection.
+#   (4) 3x open-collector NOR
+#       header: 1:GND 2:F 3:E 4:~(E|F) 5:D 6:C 7:~(C|D) 8:B 9:A 10:~(A|B)
+#       Like NAND but parallel transistors: output = 1 iff both inputs are 0.
+#       GND synthesised on GP0. No VCC pin.
+#
+# Auto-detection: NAND, then NOR, then RS (each detected by a working unit);
+# else fall back to XNOR (shown regardless). Set BOARD below to force one type.
 #
 # Optional NAND transistor-orientation check (ORIENT_CHECK, needs an ADC wire +
 # load resistor) measures a gate's output voltage under load to flag reversed
@@ -37,7 +41,7 @@ from machine import Pin, I2C, ADC
 import time
 
 # ====== board selection ======
-BOARD = "auto"           # "auto" (NAND, then RS, then XNOR), "nand", "rs", "xnor"
+BOARD = "auto"           # "auto" (NAND,NOR,RS,XNOR), "nand", "nor", "rs", "xnor"
 
 # ====== DUT header wiring: DUT pin i (1..10) -> GP(i-1) ======
 PINS = [Pin(g, Pin.IN) for g in range(10)]   # index == DUT pin - 1 == GP number
@@ -378,6 +382,70 @@ def print_xnor(results, all_ok):
     print("  RESULT:", "ALL GATES PASS" if all_ok else "FAULT DETECTED")
 
 
+# ====== board 4: 3x open-collector NOR ======
+# header: 1:GND 2:F 3:E 4:~(E|F) 5:D 6:C 7:~(C|D) 8:B 9:A 10:~(A|B)
+# Like the NAND board but parallel transistors: an output pulls LOW when EITHER
+# input is high, and floats (read via pull-up) only when both are low. So the
+# output is 1 iff both inputs are 0. GND synthesised on GP0. No VCC pin.
+NOR_GATES = [("N1 ~(A|B)", 8, 7, 9),           # (name, inA_gp, inB_gp, out_gp)
+             ("N2 ~(C|D)", 5, 4, 6),
+             ("N3 ~(E|F)", 2, 1, 3)]
+NOR_DRIVE = [1, 2, 4, 5, 7, 8]
+NOR_GND = 0
+
+
+def nor_test():
+    drive(NOR_GND, 0)                           # synthesise GND on the pin-1 line
+    for _, _, _, y in NOR_GATES:
+        release(y, Pin.PULL_UP)                 # open-collector outputs need a pull-up
+    for gp in NOR_DRIVE:
+        drive(gp, 0)
+    results = []
+    for name, a_gp, b_gp, y_gp in NOR_GATES:
+        ok = True
+        rows = []
+        for a in (0, 1):
+            for b in (0, 1):
+                for gp in NOR_DRIVE:
+                    drive(gp, 0)
+                drive(a_gp, a)
+                drive(b_gp, b)
+                time.sleep_us(SETTLE_US)
+                got = read_stable(y_gp)
+                exp = 1 if (not a and not b) else 0     # NOR
+                passed = (got == exp)
+                ok = ok and passed
+                rows.append((a, b, exp, got, passed))
+        results.append((name, ok, rows))
+    return results
+
+
+def nor_pages(results, all_ok):
+    summary = ["3x NOR TESTER"]
+    for name, ok, _ in results:
+        summary.append("%s %s" % (name, "PASS" if ok else "FAIL"))
+    summary.append("")
+    summary.append("ALL GATES PASS" if all_ok else "** FAULT **")
+    pages = [(summary, 0 if all_ok else 1, PAGE_MS)]
+    for name, ok, rows in results:
+        if not ok:
+            lines = ["%s FAIL" % name, "ab exp got"]
+            for a, b, exp, got, p in rows:
+                lines.append("%d%d  %d   %d  %s" % (a, b, exp, got, "ok" if p else "BAD"))
+            pages.append((lines, 0, DETAIL_MS))
+    return pages
+
+
+def print_nor(results, all_ok):
+    print("Board: 3x open-collector NOR")
+    for name, ok, rows in results:
+        print("  %-11s %s" % (name, "PASS" if ok else "FAIL"))
+        for a, b, exp, got, p in rows:
+            print("     a=%d b=%d exp=%d got=%d %s"
+                  % (a, b, exp, got, "ok" if p else "<- MISMATCH"))
+    print("  RESULT:", "ALL GATES PASS" if all_ok else "FAULT DETECTED")
+
+
 # ====== orchestration ======
 RECHECK_TICKS = 6        # while a page shows, re-test every RECHECK_TICKS*100 ms
 
@@ -387,25 +455,31 @@ def run_once(verbose=True):
         print("\n=== PCB tester ===")
     if BOARD == "nand":
         kind, results = "nand", nand_test()
+    elif BOARD == "nor":
+        kind, results = "nor", nor_test()
     elif BOARD == "rs":
         kind, results = "rs", rs_test()
     elif BOARD == "xnor":
         kind, results = "xnor", xnor_test()
     else:
-        # auto: NAND, then RS, then fall back to XNOR (shown regardless).
+        # auto: NAND, NOR, RS, then fall back to XNOR (shown regardless).
         nres = nand_test()
         if any(ok for _, ok, _ in nres):
             kind, results = "nand", nres
         else:
-            if verbose:
-                print("No NAND gate behaved correctly -> trying RS flip-flop")
-            rres = rs_test()
-            if any(ok for _, ok, _ in rres):
-                kind, results = "rs", rres
+            nores = nor_test()
+            if any(ok for _, ok, _ in nores):
+                kind, results = "nor", nores
             else:
                 if verbose:
-                    print("No RS flip-flop worked either -> testing as XNOR")
-                kind, results = "xnor", xnor_test()
+                    print("No NAND or NOR gate worked -> trying RS flip-flop")
+                rres = rs_test()
+                if any(ok for _, ok, _ in rres):
+                    kind, results = "rs", rres
+                else:
+                    if verbose:
+                        print("No RS flip-flop worked either -> testing as XNOR")
+                    kind, results = "xnor", xnor_test()
 
     all_ok = all(ok for _, ok, _ in results)
     overall_ok = all_ok
@@ -430,6 +504,10 @@ def run_once(verbose=True):
         pages = nand_pages(results, all_ok, vol_info)
         if vol_info:
             pages.append(orient_page(*vol_info))  # plus the verdict page
+    elif kind == "nor":
+        if verbose:
+            print_nor(results, all_ok)
+        pages = nor_pages(results, all_ok)
     elif kind == "rs":
         if verbose:
             print_rs(results, all_ok)

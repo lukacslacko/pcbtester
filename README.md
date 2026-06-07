@@ -1,19 +1,21 @@
 # Breadboard PCB Tester — Raspberry Pi Pico
 
 A Raspberry Pi Pico–based functional tester for small PCBs on a shared **10-pin
-header**. It currently knows three boards and **auto-detects** which one is
+header**. It currently knows four boards and **auto-detects** which one is
 plugged in, exercising it and reporting PASS/FAIL on an **SBC-OLED01 display**
 (with page rotation), the onboard LED, and the USB serial console:
 
 1. **3× open-collector NAND** — three 2-input NAND gates.
 2. **2× RS flip-flop** — two cross-coupled set/reset latches.
 3. **2× XNOR** — two 2-input XNOR gates.
+4. **3× open-collector NOR** — three 2-input NOR gates.
 
-Detection order: NAND, then RS, then **XNOR as the fallback** (if no NAND gate and
-no RS latch behaves, it's tested and reported as XNOR).
+Detection order: NAND, then NOR, then RS (each detected by a working unit), then
+**XNOR as the fallback** (if nothing else behaves, it's tested and reported as
+XNOR).
 
 All ten header pins go to GPIOs **GP0–GP9** (no hard ground), so the supply pins
-of each board are synthesised in firmware. One wiring tests all three boards; you
+of each board are synthesised in firmware. One wiring tests all four boards; you
 swap boards without rewiring.
 
 ---
@@ -90,6 +92,31 @@ and also covers an open-collector one.
 > not bitwise XOR. If your gate is actually **XOR**, change one line in `main.py`
 > — `exp = 1 if (a == b) else 0` → `exp = 1 if (a != b) else 0`.
 
+### Board 4 — 3× open-collector NOR
+
+10-pin header (GND first, each output last in its group):
+
+| Pin | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|-----|---|---|---|---|---|---|---|---|---|----|
+| Net | GND | F | E | ~(E&#124;F) | D | C | ~(C&#124;D) | B | A | ~(A&#124;B) |
+
+Three independent gates: **N1 = ~(A|B)**, **N2 = ~(C|D)**, **N3 = ~(E|F)**.
+Like the NAND board it's **open-collector with only a GND pin** (no VCC) — but
+the two transistors are in *parallel* instead of stacked, so the output pulls low
+when **either** input is high and floats high (read via pull-up) only when both
+are low:
+
+| in_a | in_b | output |
+|------|------|--------|
+| 0 | 0 | 1 |
+| 0 | 1 | 0 |
+| 1 | 0 | 0 |
+| 1 | 1 | 0 |
+
+GND is a driven logic-low GPIO; the three outputs are read with the Pico's
+internal pull-ups, exactly as for the NAND board. (This board is tested by its
+truth table only — no orientation/voltage check.)
+
 ---
 
 ## 2. Bill of materials
@@ -120,7 +147,7 @@ budget.
 on the Pico's left edge at physical pins 1, 2, 4, 5, 6, 7, 9, 10, 11, **12**.
 No header pin connects to the Pico's hard ground — instead the firmware *drives*
 whichever pin is GND low and whichever is VCC high. That is the whole reason one
-wiring can test all three boards, whose supply pins sit in different places.
+wiring can test all four boards, whose supply pins sit in different places.
 
 | DUT pin | Pico GPIO | Pico physical pin |
 |:------:|:---------:|:-----------------:|
@@ -148,18 +175,18 @@ pins at physical 3 and 8), so they never cross.
 
 How each GPIO is used depends on the detected board:
 
-| GP | phys | NAND board (pin) | RS board (pin) | XNOR board (pin) |
-|:--:|:----:|:-----------------|:---------------|:-----------------|
-| GP0 | 1  | A — drive            | **VCC — drive HIGH** | A — drive |
-| GP1 | 2  | B — drive            | R1 — pulse low / read | ~(A^B) — read (pull-up) |
-| GP2 | 4  | ~(A&B) — read (pull-up) | NC | B — drive |
-| GP3 | 5  | C — drive            | S1 — pulse low / read | NC |
-| GP4 | 6  | D — drive            | NC | **GND — drive LOW** |
-| GP5 | 7  | ~(C&D) — read (pull-up) | **GND — drive LOW** | **VCC — drive HIGH** |
-| GP6 | 9  | E — drive            | NC | NC |
-| GP7 | 10 | F — drive            | R2 — pulse low / read | C — drive |
-| GP8 | 11 | ~(E&F) — read (pull-up) | NC | ~(C^D) — read (pull-up) |
-| GP9 | 12 | **GND — drive LOW**  | S2 — pulse low / read | D — drive |
+| GP | phys | NAND board (pin) | RS board (pin) | XNOR board (pin) | NOR board (pin) |
+|:--:|:----:|:-----------------|:---------------|:-----------------|:----------------|
+| GP0 | 1  | A — drive            | **VCC — drive HIGH** | A — drive | **GND — drive LOW** |
+| GP1 | 2  | B — drive            | R1 — pulse low / read | ~(A^B) — read (pull-up) | F — drive |
+| GP2 | 4  | ~(A&B) — read (pull-up) | NC | B — drive | E — drive |
+| GP3 | 5  | C — drive            | S1 — pulse low / read | NC | ~(E&#124;F) — read (pull-up) |
+| GP4 | 6  | D — drive            | NC | **GND — drive LOW** | D — drive |
+| GP5 | 7  | ~(C&D) — read (pull-up) | **GND — drive LOW** | **VCC — drive HIGH** | C — drive |
+| GP6 | 9  | E — drive            | NC | NC | ~(C&#124;D) — read (pull-up) |
+| GP7 | 10 | F — drive            | R2 — pulse low / read | C — drive | B — drive |
+| GP8 | 11 | ~(E&F) — read (pull-up) | NC | ~(C^D) — read (pull-up) | A — drive |
+| GP9 | 12 | **GND — drive LOW**  | S2 — pulse low / read | D — drive | ~(A&#124;B) — read (pull-up) |
 
 ### OLED status display (SBC-OLED01)
 
@@ -238,7 +265,7 @@ node, so "plug DUT pin into a hole in the same row as the jumper's other end."
 > on the RS board the R/S lines must be pulled close to 0 V to flip a latch, and a
 > series resistor against the board's pull-up would keep them too high. The Pico's
 > internal pull-ups (NAND/XNOR outputs) and the boards' own pull-ups (RS nodes) are
-> all that's needed. All three boards are very low power, so direct drive is fine.
+> all that's needed. All four boards are very low power, so direct drive is fine.
 
 ---
 
@@ -264,8 +291,8 @@ The tester runs in **MicroPython**.
 > falls back to serial + the onboard LED.
 
 > **Forcing a board type.** `main.py` auto-detects by default. If you'd rather
-> skip detection (e.g. to avoid the brief NAND/RS probe activity on a partly-built
-> board), set `BOARD = "nand"`, `"rs"`, or `"xnor"` at the top of `main.py`
+> skip detection (e.g. to avoid the brief probe activity on a partly-built board),
+> set `BOARD = "nand"`, `"nor"`, `"rs"`, or `"xnor"` at the top of `main.py`
 > instead of `"auto"`. With your half-populated XNOR board, `BOARD = "xnor"` jumps
 > straight to the XNOR report.
 
@@ -287,9 +314,9 @@ The tester runs in **MicroPython**.
   So you can hot-swap boards and the screen follows immediately rather than waiting
   out the current page. (The raw V_OL is deliberately *excluded* from the
   change-signature so ADC noise doesn't trigger constant restarts.)
-- Detection, in order: run the NAND test — if **any gate** behaves like a NAND
-  it's NAND. Else run the RS test — if **any latch** works it's RS. Else fall back
-  to **XNOR**, which is tested and reported regardless of the result.
+- Detection, in order: **NAND** (any gate behaves like a NAND), else **NOR** (any
+  gate behaves like a NOR), else **RS** (any latch works), else fall back to
+  **XNOR**, which is tested and reported regardless of the result.
 - Open the serial console (Thonny REPL, or `screen`/`minicom`/PuTTY at the Pico's
   USB serial port) to see the full report. NAND board:
 
@@ -384,6 +411,10 @@ Board: 2x XNOR
   (`2x XNOR TESTER`, `X1 ~(A^B)` / `X2 ~(C^D)`) plus a 4-row truth-table detail
   page per failing gate, where the expected column is `1` iff the inputs are equal.
   On your current board X1 passes and X2 (not built yet) shows up `FAIL`.
+
+  The **NOR board** likewise mirrors the NAND layout — `3x NOR TESTER` with
+  `N1 ~(A|B)` / `N2 ~(C|D)` / `N3 ~(E|F)` and a per-failing-gate truth-table page,
+  where the expected column is `1` only when both inputs are `0`.
 - **Onboard LED**: steady ON = everything passes; fast blink = at least one fault.
   A redundant at-a-glance indicator that works even if the OLED is unplugged.
 - The **serial console** prints the full per-gate / per-flip-flop log each run; the
@@ -414,10 +445,12 @@ Board: 2x XNOR
 | RS: FF1 works, FF2 doesn't (or vice-versa) | Fault localised to that latch's R/S pair — check pins 8/10 (FF2) or 2/4 (FF1) and their components |
 | XNOR: a gate reads inverted (`0↔1` everywhere) | The gate is wired/built as **XOR**, not XNOR — flip the `exp` line (see §1) or fix the board |
 | XNOR: output stuck regardless of inputs | VCC (pin 6→GP5) or GND (pin 5→GP4) not reaching that gate, or its output shorted; X1 uses pins 1/2/3, X2 uses pins 8/9/10 |
+| NOR: a gate's output never goes high (stuck 0) | One input transistor always conducting (shorted/leaky), output shorted to GND, or that gate's inputs not reaching the bases. NOR output is high only at a=0,b=0 — that's the row to watch |
+| NOR: a gate's output never goes low | Both input transistors open / inputs not driving the bases, or the pull-up path broken so it always reads high |
 
-All three tests isolate faults to a single unit — a gate + input combination
-(NAND/XNOR) or FF1/FF2 with RESET vs SET (RS) — so a `BAD` line points you straight
-at the offending net or component.
+All tests isolate faults to a single unit — a gate + input combination
+(NAND/NOR/XNOR) or FF1/FF2 with RESET vs SET (RS) — so a `BAD` line points you
+straight at the offending net or component.
 
 ---
 
@@ -463,10 +496,18 @@ detection fallback because, unlike NAND (an all-1s output until both inputs are
 high) and RS (a latch you can flip), a correct XNOR has no signature the other
 two tests would mistake for their own — so "neither NAND nor RS" ⇒ treat as XNOR.
 
+### NOR board
+Mechanically identical to the NAND test — drive the inputs, read the open-collector
+outputs through the Pico's pull-ups, GND on GP0 — only the expected value differs:
+**`expected = NOT(a OR b)`**, i.e. `1` only when both inputs are low. Physically the
+two transistors are in *parallel* (each input's transistor can pull the shared
+output low on its own) rather than stacked, but to the tester it's just a different
+truth table. Tested by truth table only — no orientation/voltage check.
+
 ### Why all ten pins go to GPIOs
 A GPIO driven low is a perfectly good ground for a board that sinks well under a
 milliamp, and a GPIO driven high is a good enough 3.3 V rail for a board that
-draws almost nothing — which all three of these are. Synthesising the supplies in
+draws almost nothing — which all four of these are. Synthesising the supplies in
 firmware (instead of wiring a fixed ground) is what lets the *same* ten jumpers
 serve boards whose VCC/GND pins sit in different header positions.
 
@@ -474,7 +515,7 @@ serve boards whose VCC/GND pins sit in different header positions.
 
 ## 10. Adapting to other boards
 
-This rig is a general pattern. To add a third board:
+This rig is a general pattern. To add another board:
 - Keep the uniform wiring (DUT pin *i* → GP(i−1)); just decide each pin's role in
   firmware. Use `drive(gp, 1/0)` for VCC/GND or to apply inputs, `release(gp)` /
   `release(gp, Pin.PULL_UP)` for high-Z reads, and `read_stable(gp)` to sample.
@@ -484,8 +525,9 @@ This rig is a general pattern. To add a third board:
 - For a board needing more current than a GPIO can give, feed VCC from the Pico's
   **3V3** pin (pin 36, ~300 mA) instead of a GPIO, sharing GND.
 - Auto-detect tries each board's test in order and stops at the first that shows a
-  working unit (≥1 NAND gate ⇒ NAND; else ≥1 RS latch ⇒ RS; else XNOR fallback).
-  Put the board with no distinguishing "pass signature" last, as the fallback.
+  working unit (≥1 NAND gate ⇒ NAND; else ≥1 NOR gate ⇒ NOR; else ≥1 RS latch ⇒ RS;
+  else XNOR fallback). Put the board with no distinguishing "pass signature" last,
+  as the fallback.
 
 ---
 
