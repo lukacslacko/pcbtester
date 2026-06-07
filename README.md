@@ -1,16 +1,20 @@
 # Breadboard PCB Tester — Raspberry Pi Pico
 
 A Raspberry Pi Pico–based functional tester for small PCBs on a shared **10-pin
-header**. It currently knows two boards and **auto-detects** which one is plugged
-in, exercising it and reporting PASS/FAIL on an **SBC-OLED01 display** (with page
-rotation), the onboard LED, and the USB serial console:
+header**. It currently knows three boards and **auto-detects** which one is
+plugged in, exercising it and reporting PASS/FAIL on an **SBC-OLED01 display**
+(with page rotation), the onboard LED, and the USB serial console:
 
 1. **3× open-collector NAND** — three 2-input NAND gates.
 2. **2× RS flip-flop** — two cross-coupled set/reset latches.
+3. **2× XNOR** — two 2-input XNOR gates.
+
+Detection order: NAND, then RS, then **XNOR as the fallback** (if no NAND gate and
+no RS latch behaves, it's tested and reported as XNOR).
 
 All ten header pins go to GPIOs **GP0–GP9** (no hard ground), so the supply pins
-of each board are synthesised in firmware. One wiring tests both boards; you swap
-boards without rewiring.
+of each board are synthesised in firmware. One wiring tests all three boards; you
+swap boards without rewiring.
 
 ---
 
@@ -60,6 +64,32 @@ nodes. Pulling **R low** latches **R=0, S=1**; pulling **S low** latches
 The board draws so little current that a logic-high GPIO is enough for VCC and a
 logic-low GPIO is enough for GND — which is exactly how the tester powers it.
 
+### Board 3 — 2× XNOR
+
+Same 10-pin header, a third pinout:
+
+| Pin | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|-----|---|---|---|---|---|---|---|---|---|----|
+| Net | A | A~^B | B | NC | GND | VCC | NC | C | C~^D | D |
+
+Two independent gates: **X1 = ~(A^B)** on pins 1/2/3 and **X2 = ~(C^D)** on pins
+8/9/10. The output is **XNOR** — `1` exactly when the two inputs are **equal**:
+
+| in_a | in_b | output |
+|------|------|--------|
+| 0 | 0 | 1 |
+| 0 | 1 | 0 |
+| 1 | 0 | 0 |
+| 1 | 1 | 1 |
+
+Again, VCC is a driven logic-high GPIO and GND a driven logic-low one. The output
+is read with the Pico's pull-up enabled, which is correct for a push-pull output
+and also covers an open-collector one.
+
+> The output pins are written `A~^B` / `C~^D` to mean *XNOR* (the board's name),
+> not bitwise XOR. If your gate is actually **XOR**, change one line in `main.py`
+> — `exp = 1 if (a == b) else 0` → `exp = 1 if (a != b) else 0`.
+
 ---
 
 ## 2. Bill of materials
@@ -69,11 +99,11 @@ logic-low GPIO is enough for GND — which is exactly how the tester powers it.
 - 1× **SBC-OLED01** status display (Joy-IT 0.96″ SSD1306, 128×64, I²C)
 - 14× male–male jumper wires (10 for the DUT + 4 for the OLED)
 - USB cable (micro-USB / USB-C to match your Pico) for power + serial
-- One or both DUT boards (3× NAND and/or 2× RS flip-flop)
+- Any of the DUT boards (3× NAND, 2× RS flip-flop, 2× XNOR)
 
-No extra resistors are needed: the NAND outputs use the Pico's internal pull-ups
-and the RS nodes use the board's own pull-ups. (Skip the series resistors the
-NAND-only build mentioned — see §5; they would stop the RS latches from flipping.)
+No extra resistors are needed: the NAND/XNOR outputs use the Pico's internal
+pull-ups and the RS nodes use the board's own pull-ups. (Skip the series resistors
+the NAND-only build mentioned — see §5; they would stop the RS latches flipping.)
 
 You do **not** need an external power supply; the Pico is powered over USB, the
 OLED (~15 mA) and both DUTs run off the Pico's 3V3 rail / GPIOs, well within
@@ -87,7 +117,7 @@ budget.
 on the Pico's left edge at physical pins 1, 2, 4, 5, 6, 7, 9, 10, 11, **12**.
 No header pin connects to the Pico's hard ground — instead the firmware *drives*
 whichever pin is GND low and whichever is VCC high. That is the whole reason one
-wiring can test two boards whose supply pins are in different places.
+wiring can test all three boards, whose supply pins sit in different places.
 
 | DUT pin | Pico GPIO | Pico physical pin |
 |:------:|:---------:|:-----------------:|
@@ -115,18 +145,18 @@ pins at physical 3 and 8), so they never cross.
 
 How each GPIO is used depends on the detected board:
 
-| GP | phys | NAND board (pin) | RS board (pin) |
-|:--:|:----:|:-----------------|:---------------|
-| GP0 | 1  | A — drive            | **VCC — drive HIGH** |
-| GP1 | 2  | B — drive            | R1 — pulse low / read |
-| GP2 | 4  | ~(A&B) — read (pull-up) | NC |
-| GP3 | 5  | C — drive            | S1 — pulse low / read |
-| GP4 | 6  | D — drive            | NC |
-| GP5 | 7  | ~(C&D) — read (pull-up) | **GND — drive LOW** |
-| GP6 | 9  | E — drive            | NC |
-| GP7 | 10 | F — drive            | R2 — pulse low / read |
-| GP8 | 11 | ~(E&F) — read (pull-up) | NC |
-| GP9 | 12 | **GND — drive LOW**  | S2 — pulse low / read |
+| GP | phys | NAND board (pin) | RS board (pin) | XNOR board (pin) |
+|:--:|:----:|:-----------------|:---------------|:-----------------|
+| GP0 | 1  | A — drive            | **VCC — drive HIGH** | A — drive |
+| GP1 | 2  | B — drive            | R1 — pulse low / read | ~(A^B) — read (pull-up) |
+| GP2 | 4  | ~(A&B) — read (pull-up) | NC | B — drive |
+| GP3 | 5  | C — drive            | S1 — pulse low / read | NC |
+| GP4 | 6  | D — drive            | NC | **GND — drive LOW** |
+| GP5 | 7  | ~(C&D) — read (pull-up) | **GND — drive LOW** | **VCC — drive HIGH** |
+| GP6 | 9  | E — drive            | NC | NC |
+| GP7 | 10 | F — drive            | R2 — pulse low / read | C — drive |
+| GP8 | 11 | ~(E&F) — read (pull-up) | NC | ~(C^D) — read (pull-up) |
+| GP9 | 12 | **GND — drive LOW**  | S2 — pulse low / read | D — drive |
 
 ### OLED status display (SBC-OLED01)
 
@@ -201,12 +231,11 @@ node, so "plug DUT pin into a hole in the same row as the jumper's other end."
    SDA/SCL, are the two easiest mistakes.
 
 > **About series/pull-up resistors:** the NAND-only build suggested optional 1 kΩ
-> series resistors on the drive lines. **Leave them off for the dual-board rig** —
+> series resistors on the drive lines. **Leave them off for the multi-board rig** —
 > on the RS board the R/S lines must be pulled close to 0 V to flip a latch, and a
 > series resistor against the board's pull-up would keep them too high. The Pico's
-> internal pull-ups (NAND outputs) and the boards' own pull-ups (RS nodes) are all
-> that's needed. Both boards are described as very low power, so direct drive is
-> fine.
+> internal pull-ups (NAND/XNOR outputs) and the boards' own pull-ups (RS nodes) are
+> all that's needed. All three boards are very low power, so direct drive is fine.
 
 ---
 
@@ -232,8 +261,10 @@ The tester runs in **MicroPython**.
 > falls back to serial + the onboard LED.
 
 > **Forcing a board type.** `main.py` auto-detects by default. If you'd rather
-> skip detection (e.g. to avoid the brief NAND-probe activity on an RS board), set
-> `BOARD = "nand"` or `BOARD = "rs"` at the top of `main.py` instead of `"auto"`.
+> skip detection (e.g. to avoid the brief NAND/RS probe activity on a partly-built
+> board), set `BOARD = "nand"`, `"rs"`, or `"xnor"` at the top of `main.py`
+> instead of `"auto"`. With your half-populated XNOR board, `BOARD = "xnor"` jumps
+> straight to the XNOR report.
 
 > Prefer C/C++ SDK or rshell/ampy? Same pin map applies — DUT pin *i* → GP(i−1),
 > GND/VCC synthesised by driving the relevant GPIO; OLED on I²C1 (GP26 SDA, GP27
@@ -245,8 +276,9 @@ The tester runs in **MicroPython**.
 
 - With `main.py` on the Pico, it runs automatically at power-up, **auto-detects
   the board, and re-tests every couple of seconds** (so you can hot-swap boards).
-- Detection: it runs the NAND test first; if **not one gate** behaves like a NAND
-  it assumes the RS board and tests that instead.
+- Detection, in order: run the NAND test — if **any gate** behaves like a NAND
+  it's NAND. Else run the RS test — if **any latch** works it's RS. Else fall back
+  to **XNOR**, which is tested and reported regardless of the result.
 - Open the serial console (Thonny REPL, or `screen`/`minicom`/PuTTY at the Pico's
   USB serial port) to see the full report. NAND board:
 
@@ -265,7 +297,7 @@ Board: 3x open-collector NAND
 
 ```
 === PCB tester ===
-No NAND gate behaved correctly -> testing as RS flip-flop
+No NAND gate behaved correctly -> trying RS flip-flop
 Board: 2x RS flip-flop
   FF1  PASS   (cycle 3)
      RESET got R0 S1 (exp R0 S1)
@@ -273,6 +305,26 @@ Board: 2x RS flip-flop
   FF2  PASS   (cycle 3)
      ...
   RESULT: ALL FLIPFLOPS PASS
+```
+
+  XNOR board (here the second gate isn't built yet, so it fails — which is fine,
+  XNOR is the fallback and is reported anyway):
+
+```
+=== PCB tester ===
+No NAND gate behaved correctly -> trying RS flip-flop
+No RS flip-flop worked either -> testing as XNOR
+Board: 2x XNOR
+  X1 ~(A^B)   PASS
+     a=0 b=0 exp=1 got=1 ok
+     a=0 b=1 exp=0 got=0 ok
+     a=1 b=0 exp=0 got=0 ok
+     a=1 b=1 exp=1 got=1 ok
+  X2 ~(C^D)   FAIL
+     a=0 b=0 exp=1 got=1 ok
+     a=0 b=1 exp=0 got=1 <- MISMATCH
+     ...
+  RESULT: FAULT DETECTED
 ```
 
 - **OLED display**: shows the live verdict at a glance — no laptop needed. It
@@ -316,6 +368,11 @@ Board: 2x RS flip-flop
   low" (expect R=1, S=0). A `BAD` on SET like the one above means the latch didn't
   switch to (or hold) the set state — a stuck node, a missing pull-up, or a broken
   cross-coupling.
+
+  The **XNOR board** uses the same gate layout as the NAND board — a summary
+  (`2x XNOR TESTER`, `X1 ~(A^B)` / `X2 ~(C^D)`) plus a 4-row truth-table detail
+  page per failing gate, where the expected column is `1` iff the inputs are equal.
+  On your current board X1 passes and X2 (not built yet) shows up `FAIL`.
 - **Onboard LED**: steady ON = everything passes; fast blink = at least one fault.
   A redundant at-a-glance indicator that works even if the OLED is unplugged.
 - The **serial console** prints the full per-gate / per-flip-flop log each run; the
@@ -339,15 +396,17 @@ Board: 2x RS flip-flop
 | Results flicker between PASS/FAIL | Loose jumper or DUT not fully seated; raise `SETTLE_US`, add the external pull-ups |
 | OLED blank, serial prints "OLED unavailable" | `ssd1306.py` not copied, SDA/SCL swapped, no power (VCC/GND), or wrong address — try `0x3D` in `main.py` |
 | OLED text garbled or partly drawn | Loose I²C wire or too-long jumpers; lower I²C `freq` to `100_000` in `main.py` |
-| A working NAND board is reported as a failing RS board | Auto-detect needs **≥1 gate to pass**; if the NAND board is fully dead it looks like "not a NAND." Force `BOARD = "nand"` to see the gate detail |
+| A fully-dead NAND/RS board falls through to an "XNOR" report | Auto-detect picks the **first** type with a working unit; if none work it lands on XNOR (the fallback). Force `BOARD` to the intended type to see that board's detail |
 | RS: both nodes read the same (both 0 or both 1) | VCC (pin 1→GP0) or GND (pin 6→GP5) not reaching the board; or the latch's cross-coupling is broken / a node shorted |
 | RS: state doesn't hold (RESET ok but next read flips) | Weak/missing board pull-up on that node, or the holding transistor is open — `hold` check catches this |
 | RS: never flips at all | pin 10 still wired to the Pico's hard GND (S2 grounded), or R/S can't be pulled low — remove any series resistors |
 | RS: FF1 works, FF2 doesn't (or vice-versa) | Fault localised to that latch's R/S pair — check pins 8/10 (FF2) or 2/4 (FF1) and their components |
+| XNOR: a gate reads inverted (`0↔1` everywhere) | The gate is wired/built as **XOR**, not XNOR — flip the `exp` line (see §1) or fix the board |
+| XNOR: output stuck regardless of inputs | VCC (pin 6→GP5) or GND (pin 5→GP4) not reaching that gate, or its output shorted; X1 uses pins 1/2/3, X2 uses pins 8/9/10 |
 
-Both tests isolate faults to a single unit — a specific gate + input combination
-on the NAND board, or FF1/FF2 (and RESET vs SET) on the RS board — so a `BAD` line
-points you straight at the offending net or component.
+All three tests isolate faults to a single unit — a gate + input combination
+(NAND/XNOR) or FF1/FF2 with RESET vs SET (RS) — so a `BAD` line points you straight
+at the offending net or component.
 
 ---
 
@@ -382,12 +441,23 @@ low — so the latch **holds its state** after you release the line. The two rea
 per state are what catch a latch that switches but won't hold. The two flip-flops
 use disjoint pins, so a fault is isolated to FF1 or FF2.
 
+### XNOR board
+Power it (drive **VCC (GP5) high**, **GND (GP4) low**), then for each gate walk
+the four input combinations: drive the two inputs, wait, read the output, and
+compare against **`expected = (A == B)`** (XNOR is 1 when the inputs agree). The
+output is read with a pull-up — harmless for a push-pull output and necessary if
+it turns out to be open-collector. The two gates use disjoint pins, so a fault
+localises to X1 or X2 (handy right now, with X2 not yet built). It's the
+detection fallback because, unlike NAND (an all-1s output until both inputs are
+high) and RS (a latch you can flip), a correct XNOR has no signature the other
+two tests would mistake for their own — so "neither NAND nor RS" ⇒ treat as XNOR.
+
 ### Why all ten pins go to GPIOs
 A GPIO driven low is a perfectly good ground for a board that sinks well under a
 milliamp, and a GPIO driven high is a good enough 3.3 V rail for a board that
-draws almost nothing — which both of these are. Synthesising the supplies in
+draws almost nothing — which all three of these are. Synthesising the supplies in
 firmware (instead of wiring a fixed ground) is what lets the *same* ten jumpers
-serve two boards whose VCC/GND pins sit in different header positions.
+serve boards whose VCC/GND pins sit in different header positions.
 
 ---
 
@@ -402,8 +472,9 @@ This rig is a general pattern. To add a third board:
 - For push-pull (totem-pole) outputs, read with plain `release(gp)` (no pull-up).
 - For a board needing more current than a GPIO can give, feed VCC from the Pico's
   **3V3** pin (pin 36, ~300 mA) instead of a GPIO, sharing GND.
-- Auto-detect works by trying each board's test and using the first whose result
-  is self-consistent (here: "≥1 NAND gate passes" ⇒ NAND, else RS).
+- Auto-detect tries each board's test in order and stops at the first that shows a
+  working unit (≥1 NAND gate ⇒ NAND; else ≥1 RS latch ⇒ RS; else XNOR fallback).
+  Put the board with no distinguishing "pass signature" last, as the fallback.
 
 ---
 

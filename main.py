@@ -1,9 +1,9 @@
 # main.py
 # ---------------------------------------------------------------------------
-# Breadboard PCB tester (Raspberry Pi Pico, MicroPython) for two boards that
+# Breadboard PCB tester (Raspberry Pi Pico, MicroPython) for three boards that
 # share the same 10-pin header. All ten header pins are wired to GP0..GP9
 # (DUT pin i -> GP(i-1)); NO hard ground is used, so VCC/GND for each board
-# are synthesised by driving the matching GPIO high/low. One wiring, two boards.
+# are synthesised by driving the matching GPIO high/low. One wiring, three boards.
 #
 #   (1) 3x open-collector NAND
 #       header: 1:A 2:B 3:~(A&B) 4:C 5:D 6:~(C&D) 7:E 8:F 9:~(E&F) 10:GND
@@ -16,8 +16,14 @@
 #       VCC=GP0 high, GND=GP5 low. To flip a latch, sink one node low then
 #       release; the node stays low and its partner goes high, and it holds.
 #
-# Auto-detection: run the NAND test first; if not a single gate behaves like a
-# NAND, assume the RS board and test that instead. Set BOARD below to force one.
+#   (3) 2x XNOR
+#       header: 1:A 2:A~^B 3:B 4:NC 5:GND 6:VCC 7:NC 8:C 9:C~^D 10:D
+#       VCC=GP5 high, GND=GP4 low. Drive each gate's two inputs, read the
+#       output (= 1 iff the inputs are equal).
+#
+# Auto-detection: run the NAND test; if a gate works it's NAND. Else the RS test;
+# if a flip-flop works it's RS. Else fall back to XNOR (shown regardless). Set
+# BOARD below to force one type and skip detection.
 #
 # Output: SBC-OLED01 (SSD1306) with page rotation, onboard LED, USB serial.
 # Needs ssd1306.py on the Pico too (optional; falls back to serial + LED).
@@ -27,7 +33,7 @@ from machine import Pin, I2C
 import time
 
 # ====== board selection ======
-BOARD = "auto"           # "auto" (NAND-probe, then RS), "nand", or "rs"
+BOARD = "auto"           # "auto" (NAND, then RS, then XNOR), "nand", "rs", "xnor"
 
 # ====== DUT header wiring: DUT pin i (1..10) -> GP(i-1) ======
 PINS = [Pin(g, Pin.IN) for g in range(10)]   # index == DUT pin - 1 == GP number
@@ -232,6 +238,75 @@ def print_rs(results, all_ok):
     print("  RESULT:", "ALL FLIPFLOPS PASS" if all_ok else "FAULT DETECTED")
 
 
+# ====== board 3: 2x XNOR ======
+# header: 1:A 2:A~^B 3:B 4:NC 5:GND 6:VCC 7:NC 8:C 9:C~^D 10:D
+# Output is XNOR = NOT(A XOR B) = 1 iff the two inputs are EQUAL. (If your gate
+# is actually XOR, flip the `exp =` line below.) Output read with a pull-up,
+# which is correct for a push-pull output and also covers an open-collector one.
+XNOR_GATES = [("X1 ~(A^B)", 0, 2, 1),          # (name, inA_gp, inB_gp, out_gp)
+              ("X2 ~(C^D)", 7, 9, 8)]
+XNOR_INPUTS = [0, 2, 7, 9]
+XNOR_VCC = 5             # pin 6
+XNOR_GND = 4             # pin 5
+XNOR_NC = [3, 6]
+
+
+def xnor_test():
+    drive(XNOR_VCC, 1)                          # VCC = logic high
+    drive(XNOR_GND, 0)                          # GND = logic low
+    for gp in XNOR_NC:
+        release(gp)
+    for _, _, _, y in XNOR_GATES:
+        release(y, Pin.PULL_UP)
+    for gp in XNOR_INPUTS:
+        drive(gp, 0)
+    time.sleep_ms(2)
+    results = []
+    for name, a_gp, b_gp, y_gp in XNOR_GATES:
+        ok = True
+        rows = []
+        for a in (0, 1):
+            for b in (0, 1):
+                for gp in XNOR_INPUTS:
+                    drive(gp, 0)
+                drive(a_gp, a)
+                drive(b_gp, b)
+                time.sleep_us(SETTLE_US)
+                got = read_stable(y_gp)
+                exp = 1 if (a == b) else 0      # XNOR
+                passed = (got == exp)
+                ok = ok and passed
+                rows.append((a, b, exp, got, passed))
+        results.append((name, ok, rows))
+    return results
+
+
+def xnor_pages(results, all_ok):
+    summary = ["2x XNOR TESTER"]
+    for name, ok, _ in results:
+        summary.append("%s %s" % (name, "PASS" if ok else "FAIL"))
+    summary.append("")
+    summary.append("ALL GATES PASS" if all_ok else "** FAULT **")
+    pages = [(summary, 0 if all_ok else 1, PAGE_MS)]
+    for name, ok, rows in results:
+        if not ok:
+            lines = ["%s FAIL" % name, "ab exp got"]
+            for a, b, exp, got, p in rows:
+                lines.append("%d%d  %d   %d  %s" % (a, b, exp, got, "ok" if p else "BAD"))
+            pages.append((lines, 0, DETAIL_MS))
+    return pages
+
+
+def print_xnor(results, all_ok):
+    print("Board: 2x XNOR")
+    for name, ok, rows in results:
+        print("  %-11s %s" % (name, "PASS" if ok else "FAIL"))
+        for a, b, exp, got, p in rows:
+            print("     a=%d b=%d exp=%d got=%d %s"
+                  % (a, b, exp, got, "ok" if p else "<- MISMATCH"))
+    print("  RESULT:", "ALL GATES PASS" if all_ok else "FAULT DETECTED")
+
+
 # ====== orchestration ======
 def run_once():
     print("\n=== PCB tester ===")
@@ -239,21 +314,32 @@ def run_once():
         kind, results = "nand", nand_test()
     elif BOARD == "rs":
         kind, results = "rs", rs_test()
+    elif BOARD == "xnor":
+        kind, results = "xnor", xnor_test()
     else:
+        # auto: NAND, then RS, then fall back to XNOR (shown regardless).
         nres = nand_test()
         if any(ok for _, ok, _ in nres):
             kind, results = "nand", nres
         else:
-            print("No NAND gate behaved correctly -> testing as RS flip-flop")
-            kind, results = "rs", rs_test()
+            print("No NAND gate behaved correctly -> trying RS flip-flop")
+            rres = rs_test()
+            if any(ok for _, ok, _ in rres):
+                kind, results = "rs", rres
+            else:
+                print("No RS flip-flop worked either -> testing as XNOR")
+                kind, results = "xnor", xnor_test()
 
     all_ok = all(ok for _, ok, _ in results)
     if kind == "nand":
         print_nand(results, all_ok)
         pages = nand_pages(results, all_ok)
-    else:
+    elif kind == "rs":
         print_rs(results, all_ok)
         pages = rs_pages(results, all_ok)
+    else:
+        print_xnor(results, all_ok)
+        pages = xnor_pages(results, all_ok)
     return pages, all_ok
 
 
